@@ -21,11 +21,11 @@ use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 
 use arrow::datatypes::{Schema, SchemaRef};
 use datafusion_common::{
-    Result, not_impl_err, plan_err,
+    Result, TableReference, not_impl_err, plan_err,
     tree_node::{TreeNode, TreeNodeRecursion},
 };
 use datafusion_expr::{LogicalPlan, LogicalPlanBuilder, TableSource};
-use sqlparser::ast::{Query, SetExpr, SetOperator, With};
+use sqlparser::ast::{Ident, Query, SetExpr, SetOperator, With};
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
     pub(super) fn plan_with_clause(
@@ -46,14 +46,31 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
             // Create a logical plan for the CTE
             let cte_plan = if is_recursive {
-                self.recursive_cte(&cte_name, *cte.query, planner_context)?
+                // The declared column-list aliases (e.g. `t(n)`) must be applied
+                // to the static term *before* the work table is derived from it,
+                // so the recursive self-reference can resolve them. recursive_cte()
+                // does that; the relation-name alias is applied below.
+                let columns = cte.alias.columns.iter().map(|c| c.name.clone()).collect();
+                self.recursive_cte(&cte_name, columns, *cte.query, planner_context)?
             } else {
                 self.non_recursive_cte(*cte.query, planner_context)?
             };
 
             // Each `WITH` block can change the column names in the last
-            // projection (e.g. "WITH table(t1, t2) AS SELECT 1, 2").
-            let final_plan = self.apply_table_alias(cte_plan, cte.alias)?;
+            // projection (e.g. "WITH table(t1, t2) AS SELECT 1, 2"). For recursive
+            // CTEs the column aliases were already applied to the static term inside
+            // recursive_cte() (they must be known before the work table is built);
+            // re-aliasing them here would add a redundant projection on top of the
+            // RecursiveQuery node, so only the relation-name alias remains.
+            let final_plan = if is_recursive {
+                LogicalPlanBuilder::from(cte_plan)
+                    .alias(TableReference::bare(
+                        self.ident_normalizer.normalize(cte.alias.name),
+                    ))?
+                    .build()?
+            } else {
+                self.apply_table_alias(cte_plan, cte.alias)?
+            };
             // Export the CTE to the outer query
             planner_context.insert_cte(cte_name, final_plan);
         }
@@ -71,6 +88,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     fn recursive_cte(
         &self,
         cte_name: &str,
+        columns: Vec<Ident>,
         mut cte_query: Query,
         planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
@@ -91,9 +109,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 set_quantifier,
             } => (left, right, set_quantifier),
             other => {
-                // If the query is not a UNION, then it is not a recursive CTE
+                // If the query is not a UNION, then it is not a recursive CTE.
+                // Apply the declared column-list aliases here, since the caller
+                // only applies the relation-name alias on the recursive path.
                 *cte_query.body = other;
-                return self.non_recursive_cte(cte_query, planner_context);
+                let plan = self.non_recursive_cte(cte_query, planner_context)?;
+                return self.apply_expr_alias(plan, columns);
             }
         };
 
@@ -110,6 +131,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
         // ---------- Step 1: Compile the static term ------------------
         let static_plan = self.set_expr_to_plan(*left_expr, planner_context)?;
+
+        // Apply the CTE's declared column-list aliases (e.g. `t(n)`) to the static
+        // term now, so the work table derived below and the recursive
+        // self-reference expose the declared names. This is a no-op when no column
+        // list was given, and emits the "N columns but M names" error on a
+        // column/alias-count mismatch.
+        let static_plan = self.apply_expr_alias(static_plan, columns)?;
 
         // Since the recursive CTEs include a component that references a
         // table with its name, like the example below:
