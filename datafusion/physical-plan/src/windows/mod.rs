@@ -284,6 +284,37 @@ impl StandardWindowFunctionExpr for WindowUDFExpr {
         }
     }
 
+    fn with_new_expressions(
+        &self,
+        args: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Option<Arc<dyn StandardWindowFunctionExpr>> {
+        // `args` is a rewritten copy of `self.expressions()`, which for some
+        // functions is a *view* of the full argument list (e.g. `lead`/`lag`
+        // expose only the value argument, hiding the offset/default). Map each
+        // rewritten view expression back onto its origin in `self.args` by
+        // identity and replace it there, leaving hidden arguments untouched.
+        // Returns `None` (caller keeps the original) if the view does not line
+        // up with `self.args` — e.g. when `expressions()` synthesized a new
+        // expression that is not one of `self.args`.
+        let exposed = self.expressions();
+        if args.len() != exposed.len() {
+            return None;
+        }
+        let mut new_args = self.args.clone();
+        for (old, new) in exposed.iter().zip(args) {
+            let idx = self.args.iter().position(|arg| Arc::ptr_eq(arg, old))?;
+            new_args[idx] = new;
+        }
+        Some(Arc::new(WindowUDFExpr {
+            fun: Arc::clone(&self.fun),
+            args: new_args,
+            name: self.name.clone(),
+            input_fields: self.input_fields.clone(),
+            is_reversed: self.is_reversed,
+            ignore_nulls: self.ignore_nulls,
+        }))
+    }
+
     fn get_result_ordering(&self, schema: &SchemaRef) -> Option<PhysicalSortExpr> {
         self.fun
             .sort_options()
@@ -749,7 +780,7 @@ fn sort_options_resolving_constant(
 mod tests {
     use super::*;
     use crate::collect;
-    use crate::expressions::col;
+    use crate::expressions::{Literal, col};
     use crate::streaming::StreamingTableExec;
     use crate::test::assert_is_pending;
     use crate::test::exec::{BlockingExec, assert_strong_count_converges_to_zero};
@@ -757,8 +788,12 @@ mod tests {
     use InputOrderMode::{Linear, PartiallySorted, Sorted};
     use arrow::compute::SortOptions;
     use arrow_schema::{DataType, Field};
+    use datafusion_common::ScalarValue;
     use datafusion_execution::TaskContext;
     use datafusion_functions_aggregate::count::count_udaf;
+    use datafusion_functions_window::lead_lag::lead_udwf;
+    use datafusion_functions_window::nth_value::first_value_udwf;
+    use datafusion_functions_window::row_number::row_number_udwf;
 
     use futures::FutureExt;
 
@@ -1296,6 +1331,102 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    /// `lead`/`lag` expose only their value argument via `expressions()`; the
+    /// rewrite must swap that value while preserving the hidden offset literal.
+    #[test]
+    fn window_udf_with_new_expressions_preserves_hidden_args() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let offset: Arc<dyn PhysicalExpr> =
+            Arc::new(Literal::new(ScalarValue::Int64(Some(2))));
+        // LEAD(a, 2): the offset literal is a hidden arg not exposed by expressions().
+        let lead = create_udwf_window_expr(
+            &lead_udwf(),
+            &[col("a", &schema)?, Arc::clone(&offset)],
+            &schema,
+            "lead(a, 2)".to_string(),
+            false,
+        )?;
+        assert_eq!(
+            lead.expressions().len(),
+            1,
+            "lead exposes only the value arg"
+        );
+
+        let rewritten = lead
+            .with_new_expressions(vec![col("b", &schema)?])
+            .expect("lead should rebuild with a swapped value arg");
+        let udf = rewritten
+            .as_any()
+            .downcast_ref::<WindowUDFExpr>()
+            .expect("rebuilt expr should still be a WindowUDFExpr");
+        assert_eq!(udf.args().len(), 2);
+        // Value arg swapped a -> b, hidden offset literal preserved untouched.
+        assert_eq!(udf.args()[0].to_string(), col("b", &schema)?.to_string());
+        assert!(Arc::ptr_eq(&udf.args()[1], &offset));
+        Ok(())
+    }
+
+    /// A `StandardWindowExpr` over a value function round-trips through the
+    /// `WindowExpr` seam with its argument swapped.
+    #[test]
+    fn standard_window_expr_with_new_expressions_swaps_value_arg() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let first_value = create_udwf_window_expr(
+            &first_value_udwf(),
+            &[col("a", &schema)?],
+            &schema,
+            "first_value(a)".to_string(),
+            false,
+        )?;
+        let window_expr: Arc<dyn WindowExpr> = Arc::new(StandardWindowExpr::new(
+            first_value,
+            &[],
+            &[],
+            Arc::new(WindowFrame::new(None)),
+        ));
+
+        let rewritten = window_expr
+            .with_new_expressions(vec![col("b", &schema)?], vec![], vec![])
+            .expect("standard window expr should rebuild with a swapped arg");
+        assert_eq!(
+            rewritten.expressions()[0].to_string(),
+            col("b", &schema)?.to_string()
+        );
+        Ok(())
+    }
+
+    /// A no-argument window function (`row_number`) rebuilds unchanged rather
+    /// than failing, so such windows are left untouched by the rewrite.
+    #[test]
+    fn standard_window_expr_with_new_expressions_handles_no_arg_function() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let row_number = create_udwf_window_expr(
+            &row_number_udwf(),
+            &[],
+            &schema,
+            "row_number()".to_string(),
+            false,
+        )?;
+        let window_expr: Arc<dyn WindowExpr> = Arc::new(StandardWindowExpr::new(
+            row_number,
+            &[],
+            &[],
+            Arc::new(WindowFrame::new(None)),
+        ));
+
+        let rewritten = window_expr
+            .with_new_expressions(vec![], vec![], vec![])
+            .expect("no-arg window function should rebuild unchanged");
+        assert!(rewritten.expressions().is_empty());
         Ok(())
     }
 }

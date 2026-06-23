@@ -77,6 +77,18 @@ pub trait StandardWindowFunctionExpr: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Rebuild this window function with new argument expressions.
+    ///
+    /// `args` is a rewritten copy of [`StandardWindowFunctionExpr::expressions`]
+    /// (same length and order). Returns `None` (the default) when the function
+    /// cannot be rebuilt, in which case callers keep the original expression.
+    fn with_new_expressions(
+        &self,
+        _args: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Option<Arc<dyn StandardWindowFunctionExpr>> {
+        None
+    }
+
     /// Returns the ordering introduced by the window function, if applicable.
     /// Most window functions don't introduce an ordering, hence the default
     /// value is `None`. Note that this information is used to update ordering
