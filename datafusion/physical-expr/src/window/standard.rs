@@ -104,12 +104,30 @@ impl WindowExpr for StandardWindowExpr {
         self.expr.expressions()
     }
 
-    // `with_new_expressions` is intentionally left as the `WindowExpr` default
-    // (returns `None`): `StandardWindowFunctionExpr` exposes only the read-only
-    // `expressions()` accessor above and no arg-rewrite seam, so swapping
-    // argument expressions would require extending that trait and its
-    // implementors (e.g. `WindowUDFExpr`). Not needed for aggregate-window
-    // overflow checks, which go through `Plain`/`SlidingAggregateWindowExpr`.
+    fn with_new_expressions(
+        &self,
+        args: Vec<Arc<dyn PhysicalExpr>>,
+        partition_bys: Vec<Arc<dyn PhysicalExpr>>,
+        order_by_exprs: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Option<Arc<dyn WindowExpr>> {
+        debug_assert_eq!(self.order_by.len(), order_by_exprs.len());
+
+        let new_order_by = self
+            .order_by
+            .iter()
+            .zip(order_by_exprs)
+            .map(|(req, new_expr)| PhysicalSortExpr {
+                expr: new_expr,
+                options: req.options,
+            })
+            .collect::<Vec<_>>();
+        Some(Arc::new(StandardWindowExpr::new(
+            self.expr.with_new_expressions(args)?,
+            &partition_bys,
+            &new_order_by,
+            Arc::clone(&self.window_frame),
+        )))
+    }
 
     fn partition_by(&self) -> &[Arc<dyn PhysicalExpr>] {
         &self.partition_by
