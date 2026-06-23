@@ -94,6 +94,21 @@ impl WindowAggExec {
         })
     }
 
+    /// Clone this exec, swapping only the window expressions. The caller must
+    /// preserve output field names, as the cached schema is reused rather than
+    /// recomputed from the new expressions.
+    pub fn with_new_window_exprs(&self, window_expr: Vec<Arc<dyn WindowExpr>>) -> Self {
+        Self {
+            input: Arc::clone(&self.input),
+            window_expr,
+            schema: Arc::clone(&self.schema),
+            metrics: ExecutionPlanMetricsSet::new(),
+            ordered_partition_by_indices: self.ordered_partition_by_indices.clone(),
+            cache: Arc::clone(&self.cache),
+            can_repartition: self.can_repartition,
+        }
+    }
+
     /// Window expressions
     pub fn window_expr(&self) -> &[Arc<dyn WindowExpr>] {
         &self.window_expr
@@ -467,6 +482,7 @@ mod tests {
         WindowFrame, WindowFrameBound, WindowFrameUnits, WindowFunctionDefinition,
     };
     use datafusion_functions_aggregate::count::count_udaf;
+    use datafusion_physical_expr::window::PlainAggregateWindowExpr;
 
     #[test]
     fn test_window_agg_cardinality_effect() -> Result<()> {
@@ -496,6 +512,101 @@ mod tests {
             window.cardinality_effect(),
             CardinalityEffect::Equal
         ));
+        Ok(())
+    }
+
+    /// An unbounded frame produces a [`PlainAggregateWindowExpr`], which must now
+    /// support argument rewriting via [`WindowExpr::with_new_expressions`] (it
+    /// previously fell through to the trait default and returned `None`).
+    #[test]
+    fn plain_aggregate_with_new_expressions_swaps_args() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        // Unbounded end bound -> PlainAggregateWindowExpr (a bounded end would
+        // route to SlidingAggregateWindowExpr instead).
+        let window_expr = create_window_expr(
+            &WindowFunctionDefinition::AggregateUDF(count_udaf()),
+            "count(a)".to_string(),
+            &[crate::expressions::col("a", &schema)?],
+            &[],
+            &[],
+            Arc::new(WindowFrame::new(None)),
+            Arc::clone(&schema),
+            false,
+            false,
+            None,
+        )?;
+        assert!(
+            window_expr
+                .as_any()
+                .downcast_ref::<PlainAggregateWindowExpr>()
+                .is_some(),
+            "unbounded frame should produce a PlainAggregateWindowExpr"
+        );
+
+        // Swap the single argument `a` -> `b`.
+        let rewritten = window_expr
+            .with_new_expressions(
+                vec![crate::expressions::col("b", &schema)?],
+                vec![],
+                vec![],
+            )
+            .expect("PlainAggregateWindowExpr should support argument rewrite");
+        assert!(
+            rewritten
+                .as_any()
+                .downcast_ref::<PlainAggregateWindowExpr>()
+                .is_some()
+        );
+        assert_eq!(
+            rewritten.expressions()[0].to_string(),
+            crate::expressions::col("b", &schema)?.to_string(),
+        );
+        Ok(())
+    }
+
+    /// `with_new_window_exprs` swaps the expressions while reusing the cached
+    /// schema (the caller is responsible for keeping output field names stable).
+    #[test]
+    fn window_agg_exec_with_new_window_exprs_preserves_schema() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(TestMemoryExec::try_new(&[], Arc::clone(&schema), None)?);
+        let make_expr = |arg: &str| -> Result<Arc<dyn WindowExpr>> {
+            create_window_expr(
+                &WindowFunctionDefinition::AggregateUDF(count_udaf()),
+                "count(a)".to_string(),
+                &[crate::expressions::col(arg, &schema)?],
+                &[],
+                &[],
+                Arc::new(WindowFrame::new(None)),
+                Arc::clone(&schema),
+                false,
+                false,
+                None,
+            )
+        };
+
+        let exec = WindowAggExec::try_new(vec![make_expr("a")?], input, true)?;
+        // Same output name, different argument expression -> schema is reused.
+        let new_exec = exec.with_new_window_exprs(vec![make_expr("b")?]);
+
+        let orig_schema = exec.schema();
+        let new_schema = new_exec.schema();
+        assert!(
+            Arc::ptr_eq(&orig_schema, &new_schema),
+            "cached schema should be reused, not recomputed"
+        );
+        assert_eq!(new_exec.window_expr().len(), 1);
+        assert_eq!(
+            new_exec.window_expr()[0].expressions()[0].to_string(),
+            crate::expressions::col("b", &schema)?.to_string(),
+        );
         Ok(())
     }
 }

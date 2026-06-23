@@ -104,6 +104,13 @@ impl WindowExpr for StandardWindowExpr {
         self.expr.expressions()
     }
 
+    // `with_new_expressions` is intentionally left as the `WindowExpr` default
+    // (returns `None`): `StandardWindowFunctionExpr` exposes only the read-only
+    // `expressions()` accessor above and no arg-rewrite seam, so swapping
+    // argument expressions would require extending that trait and its
+    // implementors (e.g. `WindowUDFExpr`). Not needed for aggregate-window
+    // overflow checks, which go through `Plain`/`SlidingAggregateWindowExpr`.
+
     fn partition_by(&self) -> &[Arc<dyn PhysicalExpr>] {
         &self.partition_by
     }
