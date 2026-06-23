@@ -140,6 +140,22 @@ impl BoundedWindowAggExec {
         })
     }
 
+    /// Clone this exec, swapping only the window expressions. The caller must
+    /// preserve output field names, as the cached schema is reused rather than
+    /// recomputed from the new expressions.
+    pub fn with_new_window_exprs(&self, window_expr: Vec<Arc<dyn WindowExpr>>) -> Self {
+        Self {
+            input: Arc::clone(&self.input),
+            window_expr,
+            schema: Arc::clone(&self.schema),
+            metrics: ExecutionPlanMetricsSet::new(),
+            input_order_mode: self.input_order_mode.clone(),
+            ordered_partition_by_indices: self.ordered_partition_by_indices.clone(),
+            cache: Arc::clone(&self.cache),
+            can_repartition: self.can_repartition,
+        }
+    }
+
     /// Window expressions
     pub fn window_expr(&self) -> &[Arc<dyn WindowExpr>] {
         &self.window_expr
@@ -1264,7 +1280,8 @@ mod tests {
     use crate::streaming::{PartitionStream, StreamingTableExec};
     use crate::test::TestMemoryExec;
     use crate::windows::{
-        BoundedWindowAggExec, InputOrderMode, create_udwf_window_expr, create_window_expr,
+        BoundedWindowAggExec, InputOrderMode, WindowExpr, create_udwf_window_expr,
+        create_window_expr,
     };
     use crate::{ExecutionPlan, displayable, execute_stream};
 
@@ -1858,6 +1875,59 @@ mod tests {
             plan.cardinality_effect(),
             CardinalityEffect::Equal
         ));
+        Ok(())
+    }
+
+    /// `BoundedWindowAggExec::with_new_window_exprs` mirrors the unbounded exec:
+    /// it swaps the window expressions while reusing the cached schema, and the
+    /// extra `input_order_mode` field is carried over.
+    #[test]
+    fn bounded_window_agg_exec_with_new_window_exprs_preserves_schema() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(TestMemoryExec::try_new(&[], Arc::clone(&schema), None)?);
+        let make_expr = |arg: &str| -> Result<Arc<dyn WindowExpr>> {
+            create_window_expr(
+                &WindowFunctionDefinition::AggregateUDF(count_udaf()),
+                "count(a)".to_string(),
+                &[col(arg, &schema)?],
+                &[],
+                &[],
+                // Bounded end bound -> the sliding aggregate a bounded exec carries.
+                Arc::new(WindowFrame::new_bounds(
+                    WindowFrameUnits::Rows,
+                    WindowFrameBound::Preceding(ScalarValue::UInt64(None)),
+                    WindowFrameBound::CurrentRow,
+                )),
+                Arc::clone(&schema),
+                false,
+                false,
+                None,
+            )
+        };
+
+        let exec = BoundedWindowAggExec::try_new(
+            vec![make_expr("a")?],
+            input,
+            InputOrderMode::Linear,
+            true,
+        )?;
+        let new_exec = exec.with_new_window_exprs(vec![make_expr("b")?]);
+
+        let orig_schema = exec.schema();
+        let new_schema = new_exec.schema();
+        assert!(
+            Arc::ptr_eq(&orig_schema, &new_schema),
+            "cached schema should be reused, not recomputed"
+        );
+        assert_eq!(new_exec.window_expr().len(), 1);
+        assert_eq!(
+            new_exec.window_expr()[0].expressions()[0].to_string(),
+            col("b", &schema)?.to_string(),
+        );
         Ok(())
     }
 }
