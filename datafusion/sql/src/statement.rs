@@ -1039,6 +1039,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 multi_table_into_clauses,
                 multi_table_when_clauses,
                 multi_table_else_clause,
+                overriding: _, // OVERRIDING { SYSTEM | USER } VALUE — not modeled
             }) => {
                 let table_name = match table {
                     TableObject::TableName(table_name) => table_name,
