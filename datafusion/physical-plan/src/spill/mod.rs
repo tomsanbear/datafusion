@@ -294,14 +294,16 @@ impl IPCStreamWriter {
     ///
     /// # Codec contract
     ///
-    /// `arrow-ipc` must be compiled with the `lz4` and `zstd` features
-    /// (declared explicitly in `datafusion-physical-plan/Cargo.toml`). If
-    /// those features are absent, `try_with_compression` will return an
-    /// error at runtime for [`SpillCompression::Lz4Frame`] and
-    /// [`SpillCompression::Zstd`] variants. The Cargo dependency keeps this
-    /// contract local and build-visible during Cargo feature resolution,
-    /// rather than relying solely on workspace-level feature unification;
-    /// see #21917.
+    /// `arrow-ipc` must be compiled with the `lz4` feature everywhere and
+    /// the `zstd` feature on non-wasm targets (declared explicitly in
+    /// `datafusion-physical-plan/Cargo.toml`; `zstd` is target-gated off
+    /// wasm32 because it links the C `zstd-sys`, and spill-to-disk does not
+    /// exist on wasm). If a needed codec feature is absent,
+    /// `try_with_compression` returns an error at runtime for the
+    /// [`SpillCompression::Lz4Frame`] / [`SpillCompression::Zstd`] variants.
+    /// The Cargo dependency keeps this contract local and build-visible
+    /// during Cargo feature resolution, rather than relying solely on
+    /// workspace-level feature unification; see #21917.
     pub fn new(
         path: &Path,
         schema: &Schema,
