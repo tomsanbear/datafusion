@@ -350,6 +350,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 distkey,
                 sortkey,
                 backup,
+                colocate_with: _,
+                in_colocation_group: _,
             }) => {
                 if temporary {
                     return not_impl_err!("Temporary tables not supported");
