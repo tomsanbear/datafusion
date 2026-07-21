@@ -26,6 +26,7 @@ use std::vec;
 
 use arrow::datatypes::{TimeUnit::Nanosecond, *};
 use common::MockContextProvider;
+use datafusion_common::format::ExplainFormat;
 use datafusion_common::{DFSchema, DataFusionError, Result, assert_contains};
 use datafusion_expr::{
     ColumnarValue, CreateIndex, DdlStatement, Expr, HigherOrderFunctionArgs,
@@ -687,6 +688,74 @@ fn plan_explain_copy_to_format() {
         TableScan: test_decimal
     "
     );
+}
+
+#[test]
+fn plan_explain_parenthesized_analyze() {
+    // The parenthesized option list folds into the same flags the keyword
+    // prefixes set. Dropping it (the old `..` rest-pattern) ran
+    // `EXPLAIN (ANALYZE)` as a plain EXPLAIN — the statement the user asked
+    // to execute never executed.
+    let sql = "EXPLAIN (ANALYZE) SELECT id FROM person";
+    let plan = logical_plan(sql).unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Analyze
+      Projection: person.id
+        TableScan: person
+    "
+    );
+}
+
+#[test]
+fn plan_explain_parenthesized_verbose_and_boolean_args() {
+    let plan = logical_plan("EXPLAIN (VERBOSE) SELECT id FROM person").unwrap();
+    let LogicalPlan::Explain(explain) = &plan else {
+        panic!("expected Explain, got {plan:?}");
+    };
+    assert!(explain.verbose, "parenthesized VERBOSE must set the flag");
+
+    // Boolean arguments toggle the flags both ways.
+    let plan =
+        logical_plan("EXPLAIN (ANALYZE false, VERBOSE true) SELECT id FROM person")
+            .unwrap();
+    let LogicalPlan::Explain(explain) = &plan else {
+        panic!("expected Explain (analyze false), got {plan:?}");
+    };
+    assert!(explain.verbose);
+}
+
+#[test]
+fn plan_explain_parenthesized_format() {
+    // A renderable format is honoured rather than ignored.
+    let plan = logical_plan("EXPLAIN (FORMAT tree) SELECT id FROM person").unwrap();
+    let LogicalPlan::Explain(explain) = &plan else {
+        panic!("expected Explain, got {plan:?}");
+    };
+    assert_eq!(explain.explain_format, ExplainFormat::Tree);
+
+    // A format DataFusion cannot render errors loudly instead of silently
+    // producing the default.
+    let err = logical_plan("EXPLAIN (FORMAT JSON) SELECT id FROM person").unwrap_err();
+    assert!(
+        err.to_string().contains("Invalid explain format"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn plan_explain_unsupported_option_errors() {
+    for sql in [
+        "EXPLAIN (COSTS) SELECT id FROM person",
+        "EXPLAIN (BUFFERS true) SELECT id FROM person",
+    ] {
+        let err = logical_plan(sql).unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported EXPLAIN option"),
+            "{sql}: got {err}"
+        );
+    }
 }
 
 #[test]

@@ -759,9 +759,42 @@ impl<'a> DFParser<'a> {
 
     /// Parse a SQL `EXPLAIN`
     pub fn parse_explain(&mut self) -> Result<Statement, DataFusionError> {
-        let analyze = self.parser.parse_keyword(Keyword::ANALYZE);
-        let verbose = self.parser.parse_keyword(Keyword::VERBOSE);
-        let format = self.parse_explain_format()?;
+        let mut analyze = self.parser.parse_keyword(Keyword::ANALYZE);
+        let mut verbose = self.parser.parse_keyword(Keyword::VERBOSE);
+        let mut format = self.parse_explain_format()?;
+
+        // The PostgreSQL parenthesized option list: `EXPLAIN (ANALYZE,
+        // VERBOSE false, FORMAT tree) <statement>`. Attempted only when no
+        // keyword prefix was written and the parenthesized token cannot
+        // start a statement, so `EXPLAIN (SELECT 1)` keeps parsing as an
+        // explained parenthesized query. Unknown options error rather than
+        // being dropped — a dropped `(ANALYZE)` would run the statement as
+        // a plain EXPLAIN.
+        let parens_start_statement = || {
+            let after_lparen = &self.parser.peek_nth_token_ref(1).token;
+            matches!(after_lparen, Token::LParen)
+                || matches!(
+                    after_lparen,
+                    Token::Word(w) if matches!(
+                        w.keyword,
+                        Keyword::SELECT | Keyword::VALUES | Keyword::WITH
+                    )
+                )
+        };
+        if !analyze
+            && !verbose
+            && format.is_none()
+            && self.parser.peek_token_ref().token == Token::LParen
+            && !parens_start_statement()
+        {
+            let options = self.parser.parse_utility_options()?;
+            crate::utils::fold_explain_options(
+                options,
+                &mut analyze,
+                &mut verbose,
+                &mut format,
+            )?;
+        }
 
         let statement = self.parse_statement()?;
 
@@ -1880,6 +1913,56 @@ mod tests {
             });
             assert_eq!(verified_stmt(sql), expected);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn explain_parenthesized_options() -> Result<(), DataFusionError> {
+        // The PostgreSQL parenthesized option list folds into the same
+        // flags the keyword prefixes set (dropping it ran the statement as
+        // a plain EXPLAIN).
+        let cases = vec![
+            ("EXPLAIN (ANALYZE) SELECT 1", true, false, None),
+            ("EXPLAIN (VERBOSE) SELECT 1", false, true, None),
+            ("EXPLAIN (ANALYZE, VERBOSE) SELECT 1", true, true, None),
+            (
+                "EXPLAIN (ANALYZE false, VERBOSE true) SELECT 1",
+                false,
+                true,
+                None,
+            ),
+            (
+                "EXPLAIN (FORMAT tree) SELECT 1",
+                false,
+                false,
+                Some("tree".to_string()),
+            ),
+        ];
+        for (sql, analyze, verbose, format) in cases {
+            let statements = DFParser::parse_sql(sql)?;
+            assert_eq!(statements.len(), 1, "{sql}");
+            let Statement::Explain(explain) = &statements[0] else {
+                panic!("{sql}: expected EXPLAIN, got {statements:?}");
+            };
+            assert_eq!(explain.analyze, analyze, "{sql}");
+            assert_eq!(explain.verbose, verbose, "{sql}");
+            assert_eq!(explain.format, format, "{sql}");
+        }
+
+        // An unknown option errors rather than silently dropping.
+        let err = DFParser::parse_sql("EXPLAIN (COSTS) SELECT 1").unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported EXPLAIN option"),
+            "got: {err}"
+        );
+
+        // A parenthesized query directly after EXPLAIN still parses as the
+        // explained statement, not an option list.
+        let statements = DFParser::parse_sql("EXPLAIN (SELECT 1)")?;
+        let Statement::Explain(explain) = &statements[0] else {
+            panic!("expected EXPLAIN, got {statements:?}");
+        };
+        assert!(!explain.analyze && !explain.verbose && explain.format.is_none());
         Ok(())
     }
 

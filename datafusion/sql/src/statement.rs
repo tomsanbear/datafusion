@@ -268,22 +268,58 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             Statement::Explain {
                 describe_alias: DescribeAlias::Describe | DescribeAlias::Desc, // only parse 'DESCRIBE statement' or 'DESC statement' and not 'EXPLAIN statement'
                 statement,
+                options,
                 ..
-            } => match *statement {
-                Statement::Query(query) => self.describe_query_to_plan(*query),
-                _ => {
-                    not_impl_err!("Describing statements other than SELECT not supported")
+            } => {
+                // DESCRIBE reports the query's schema; an option list has no
+                // meaning here and must not be silently dropped.
+                if options.is_some_and(|options| !options.is_empty()) {
+                    return not_impl_err!("DESCRIBE with options is not supported");
                 }
-            },
+                match *statement {
+                    Statement::Query(query) => self.describe_query_to_plan(*query),
+                    _ => {
+                        not_impl_err!(
+                            "Describing statements other than SELECT not supported"
+                        )
+                    }
+                }
+            }
             Statement::Explain {
                 verbose,
                 statement,
                 analyze,
                 format,
+                options,
+                query_plan,
+                estimate,
                 describe_alias: _,
-                ..
             } => {
-                let format = format.map(|format| format.to_string());
+                // SQLite `EXPLAIN QUERY PLAN` and ClickHouse `EXPLAIN
+                // ESTIMATE` have no DataFusion semantics; reject rather than
+                // run a plain EXPLAIN the user did not ask for.
+                if query_plan {
+                    return not_impl_err!("EXPLAIN QUERY PLAN is not supported");
+                }
+                if estimate {
+                    return not_impl_err!("EXPLAIN ESTIMATE is not supported");
+                }
+                let mut verbose = verbose;
+                let mut analyze = analyze;
+                let mut format = format.map(|format| format.to_string());
+                // Fold the PostgreSQL parenthesized option list into the
+                // same flags the keyword prefixes set. Silently dropping the
+                // list ran `EXPLAIN (ANALYZE) …` as a plain EXPLAIN — the
+                // statement the user asked to execute never executed — and
+                // ignored a requested FORMAT.
+                if let Some(options) = options {
+                    crate::utils::fold_explain_options(
+                        options,
+                        &mut analyze,
+                        &mut verbose,
+                        &mut format,
+                    )?;
+                }
                 let statement = DFStatement::Statement(statement);
                 self.explain_to_plan(verbose, analyze, format, statement)
             }

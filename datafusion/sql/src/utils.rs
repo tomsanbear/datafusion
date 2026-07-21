@@ -27,7 +27,8 @@ use datafusion_common::tree_node::{
 };
 use datafusion_common::{
     Column, DFSchemaRef, Diagnostic, HashMap, Result, ScalarValue,
-    assert_or_internal_err, exec_datafusion_err, exec_err, internal_err, plan_err,
+    assert_or_internal_err, exec_datafusion_err, exec_err, internal_err, not_impl_err,
+    plan_err,
 };
 use datafusion_expr::builder::get_struct_unnested_columns;
 use datafusion_expr::expr::{
@@ -39,7 +40,48 @@ use datafusion_expr::{
 };
 
 use indexmap::IndexMap;
-use sqlparser::ast::{Ident, Value};
+use sqlparser::ast::{Expr as SQLExpr, Ident, UtilityOption, Value};
+
+/// Fold PostgreSQL parenthesized EXPLAIN utility options —
+/// `EXPLAIN (ANALYZE, VERBOSE false, FORMAT tree) <statement>` — into the
+/// flag set the keyword prefixes populate. Unknown options and non-boolean
+/// arguments error rather than being dropped: a silently dropped `(ANALYZE)`
+/// would run the statement as a plain EXPLAIN, so the statement the user
+/// asked to execute would never execute.
+pub(crate) fn fold_explain_options(
+    options: Vec<UtilityOption>,
+    analyze: &mut bool,
+    verbose: &mut bool,
+    format: &mut Option<String>,
+) -> Result<()> {
+    for option in options {
+        match option.name.value.to_uppercase().as_str() {
+            "ANALYZE" => *analyze = explain_option_flag(&option)?,
+            "VERBOSE" => *verbose = explain_option_flag(&option)?,
+            "FORMAT" => match &option.arg {
+                Some(SQLExpr::Identifier(ident)) => *format = Some(ident.value.clone()),
+                Some(other) => *format = Some(other.to_string()),
+                None => return plan_err!("EXPLAIN FORMAT requires an argument"),
+            },
+            _ => return not_impl_err!("Unsupported EXPLAIN option: {option}"),
+        }
+    }
+    Ok(())
+}
+
+/// One boolean EXPLAIN option's value: bare (`ANALYZE`) is `true`, an
+/// explicit boolean argument (`ANALYZE false`) is honoured, anything else
+/// errors.
+fn explain_option_flag(option: &UtilityOption) -> Result<bool> {
+    match &option.arg {
+        None => Ok(true),
+        Some(SQLExpr::Value(value)) => match &value.value {
+            Value::Boolean(flag) => Ok(*flag),
+            other => not_impl_err!("Unsupported EXPLAIN option argument: {other}"),
+        },
+        Some(other) => not_impl_err!("Unsupported EXPLAIN option argument: {other}"),
+    }
+}
 
 /// Make a best-effort attempt at resolving all columns in the expression tree
 pub(crate) fn resolve_columns(expr: &Expr, plan: &LogicalPlan) -> Result<Expr> {

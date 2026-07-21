@@ -292,3 +292,11 @@ debug = false
 debug-assertions = false
 strip = "debuginfo"
 incremental = false
+
+# QuiltDB fork wiring: this branch (`quiltdb-base`) binds fields that exist
+# only in the QuiltDB sqlparser fork (Insert.overriding, the CreateTable
+# colocation fields, CommentObject::Constraint, …), so the workspace must
+# resolve sqlparser from that fork to build standalone. The rev matches the
+# QuiltDB workspace's graph-wide pin; advance the two together.
+[patch.crates-io]
+sqlparser = { git = "https://github.com/tomsanbear/datafusion-sqlparser-rs", rev = "fafe03d2716ff1f57985e79b1932fa66143b44d2" }
